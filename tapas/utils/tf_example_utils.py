@@ -139,6 +139,7 @@ class ClassifierConversionConfig(TrimmedConversionConfig):
   update_answer_coordinates: bool = False
   # Drop last rows if table doesn't fit within max sequence length.
   drop_rows_to_fit: bool = False
+  pruning_opt_level: int = 0
 
 
 
@@ -436,6 +437,8 @@ class ToTensorflowExampleBase:
       num_columns,
       num_rows,
       num_tokens,
+      col_include = None,
+      cell_include = None,
   ):
     """Serializes table and text."""
     tokens, segment_ids, column_ids, row_ids = self._serialize_text(
@@ -448,10 +451,17 @@ class ToTensorflowExampleBase:
 
     for token, column_id, row_id in self._get_table_values(
         table, num_columns, num_rows, num_tokens):
-      tokens.append(token)
-      segment_ids.append(1)
-      column_ids.append(column_id)
-      row_ids.append(row_id)
+      if col_include or cell_include:
+        if (column_id-1) in col_include or (row_id, column_id-1) in cell_include:
+          tokens.append(token)
+          segment_ids.append(1)
+          column_ids.append(column_id)
+          row_ids.append(row_id)
+      else:
+        tokens.append(token)
+        segment_ids.append(1)
+        column_ids.append(column_id)
+        row_ids.append(row_id)
 
     return SerializedExample(
         tokens=tokens,
@@ -806,7 +816,8 @@ class ToPretrainingTensorflowExample(ToTensorflowExampleBase):
         return None
 
       serialized_example = self._serialize(question_tokens, tokenized_table,
-                                           num_columns, num_rows, num_tokens)
+                                           num_columns, num_rows, num_tokens,
+                                           col_include, cell_include)
       tokens = serialized_example.tokens
       segment_ids = serialized_example.segment_ids
       row_ids = serialized_example.row_ids
@@ -1001,6 +1012,8 @@ class ToTrimmedTensorflowExample(ToTensorflowExampleBase):
       num_columns,
       num_rows,
       drop_rows_to_fit = False,
+      col_include = None,
+      cell_include = None
   ):
     """Finds optiomal number of table tokens to include and serializes."""
     init_num_rows = num_rows
@@ -1019,7 +1032,8 @@ class ToTrimmedTensorflowExample(ToTensorflowExampleBase):
       # Try to drop a row to fit the table.
       num_rows -= 1
     serialized_example = self._serialize(question_tokens, tokenized_table,
-                                         num_columns, num_rows, num_tokens)
+                                         num_columns, num_rows, num_tokens,
+                                         col_include, cell_include)
 
     assert len(serialized_example.tokens) <= self._max_seq_length
 
@@ -1068,6 +1082,7 @@ class ToClassifierTensorflowExample(ToTrimmedTensorflowExample):
     self._use_document_title = config.use_document_title
     self._update_answer_coordinates = config.update_answer_coordinates
     self._drop_rows_to_fit = config.drop_rows_to_fit
+    self._pruning_opt_level = config.pruning_opt_level
 
   def _tokenize_extended_question(
       self,
@@ -1084,6 +1099,54 @@ class ToClassifierTensorflowExample(ToTrimmedTensorflowExample):
       text_tokens.extend(document_title_tokens)
     return text_tokens
 
+  def get_used_token_coords(self, questions,
+                      table):
+    q_token_pieces = set()
+    for question in questions:
+      text_tokens = self._tokenize_extended_question(question, table)
+      for q_token in text_tokens:
+        q_token_pieces.add(q_token.piece)
+
+    col_include = set() # col
+    cell_include = set() # (row, col)
+
+    def collect_coord(token_piece, coord, for_col):
+      for q_token_piece in q_token_pieces:
+        if len(token_piece) < 3 or len(q_token_piece) < 3:
+          if q_token_piece == token_piece:
+            if for_col:
+              col_include.add(coord.column_index)
+            else:
+              cell_include.add((coord.row_index, coord.column_index))
+        else:
+          if q_token_piece in token_piece or token_piece in q_token_piece:
+            if for_col:
+              col_include.add(coord.column_index)
+            else:
+              cell_include.add((coord.row_index, coord.column_index))
+
+    tokenized_table = self._tokenize_table(table)
+    token_idx = 0
+    for row in tokenized_table.rows:
+      for cell in row:
+        for token in cell:
+          token_piece = token.piece
+          coord = tokenized_table.selected_tokens[token_idx]
+          if coord.row_index == 0:
+            collect_coord(token_piece, coord, True)
+          else:
+            collect_coord(token_piece, coord, False)
+          token_idx = token_idx + 1
+
+    if self._pruning_opt_level == 0:
+      return None, None
+    elif self._pruning_opt_level == 1:
+      for pair in cell_include:
+        col_include.add(pair[1])
+      return col_include, set()
+    else:
+      return col_include, cell_include
+
   def convert(self, interaction,
               index):
     """Converts question at 'index' to example."""
@@ -1096,6 +1159,8 @@ class ToClassifierTensorflowExample(ToTrimmedTensorflowExample):
     if not interaction.questions[index].answer.is_valid:
       raise ValueError('Invalid answer')
 
+    # token optimization
+    col_include, cell_include = self.get_used_token_coords(interaction.questions, table)
 
     text_tokens = self._tokenize_extended_question(question, table)
     tokenized_table = self._tokenize_table(table)
@@ -1119,10 +1184,14 @@ class ToClassifierTensorflowExample(ToTrimmedTensorflowExample):
         tokenized_table=tokenized_table,
         num_columns=num_columns,
         num_rows=num_rows,
-        drop_rows_to_fit=self._drop_rows_to_fit)
+        drop_rows_to_fit=self._drop_rows_to_fit,
+        col_include=col_include,
+        cell_include=cell_include)
 
     column_ids = serialized_example.column_ids
     row_ids = serialized_example.row_ids
+
+    token_cnt = len(column_ids)
 
     def get_answer_ids(question):
       if self._update_answer_coordinates:
@@ -1198,7 +1267,7 @@ class ToClassifierTensorflowExample(ToTrimmedTensorflowExample):
       features['can_indexes'] = create_int_feature(indexes)
 
 
-    return tf.train.Example(features=tf.train.Features(feature=features))
+    return tf.train.Example(features=tf.train.Features(feature=features)), token_cnt
 
   def get_empty_example(self):
     interaction = interaction_pb2.Interaction(questions=[
